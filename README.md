@@ -111,6 +111,7 @@ Detection of high-frequency logon failures using Event ID 4625 aggregated by sou
 
 
 
+
 ### 2. Unauthorized Account Provisioning & Privilege Escalation
 Telemetry correlation showing the creation of `RogueAnalyst` (Event 4720) and subsequent addition to the local Administrators group (Event 4732).
 
