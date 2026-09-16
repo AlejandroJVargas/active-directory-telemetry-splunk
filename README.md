@@ -109,9 +109,13 @@ index=main sourcetype="WinEventLog:Security" (EventCode=4720 OR EventCode=4732)
 ### 1. Brute-Force & Credential Access Detection
 Detection of high-frequency logon failures using Event ID 4625 aggregated by source IP and target principal.
 
-
-
+![Brute Force Detection](evidence/Active%20Detection%20Brute%20Force.png)
 
 ### 2. Unauthorized Account Provisioning & Privilege Escalation
-Telemetry correlation showing the creation of `RogueAnalyst` (Event 4720) and subsequent addition to the local Administrators group (Event 4732).
+Telemetry correlation showing the creation of `RogueAnalyst` (Event ID 4720) and subsequent addition to the local Administrators group (Event ID 4732).
 
+![Privilege Escalation Detection 1](evidence/Privilege%20Escalation%201.png)
+
+Detailed event breakdown and timestamp sequencing:
+
+![Privilege Escalation Detection 2](evidence/Privilege%20Escalation%202.png)
