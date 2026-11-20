@@ -1,32 +1,24 @@
-# Active Directory & Windows Telemetry: Threat Detection & Security Insights with Splunk
+# Windows Security Telemetry & Identity Attack Detection (Splunk)
 
-## Project Overview
-This project simulates enterprise-level identity monitoring and security analytics using **Splunk Enterprise** as a centralized SIEM and the **Splunk Universal Forwarder** to collect and ingest Windows Security Event logs (`Security.evtx`).
+I built a small two-VM lab: a Windows 10 machine sends its Security event log to Splunk on Ubuntu through the Splunk Universal Forwarder. Then I ran simple identity attacks on the Windows machine (failed logons, creating a backdoor admin account) and wrote SPL searches to detect them.
 
-The objective is to establish end-to-end detection engineering: ingesting live endpoint events, simulating credential-based attacks, mapping malicious techniques to the **MITRE ATT&CK framework**, and developing targeted detection logic (SPL) to mitigate identity-based risks.
-
----
-
-## Architectural Topology
-* **SIEM Platform (Monitoring Server):** Splunk Enterprise deployed on Ubuntu Linux (Log Ingestion on TCP/9997, Web UI on TCP/8000).
-* **Telemetry Source (Endpoint / Domain Simulation):** Windows 10 client forwarding Windows Security Event logs (`WinEventLog:Security`) via Splunk Universal Forwarder.
-* **Network Infrastructure:** Isolated VirtualBox Private NAT Network ensuring bidirectional communication between hosts.
-
-+--------------------------+          TCP/9997           +---------------------------+
-|    Windows 10 Victim     |  ------------------------>  |     Ubuntu Splunk SIEM    |
-| (Universal Forwarder)    |   (WinEventLog:Security)    | (Ingestion & Dashboards)  |
-+--------------------------+                             +---------------------------+
+**Tools:** Splunk Enterprise 10.4, Splunk Universal Forwarder, VirtualBox, PowerShell.
 
 ---
 
-## Ingestion Pipeline Configuration
+## Lab setup
 
-### 1. Splunk Indexer Receiver Setup (Ubuntu)
-Splunk was configured to listen for incoming forwarder connections on port `9997`:
-* **Path:** `Settings` > `Forwarding and receiving` > `Receive data` > `Listen on port 9997`.
+```
++--------------------------+        TCP/9997         +---------------------------+
+|   Windows 10 (victim)    |  -------------------->  |   Ubuntu (Splunk SIEM)    |
+|   Universal Forwarder    |  WinEventLog:Security   |   Web UI on TCP/8000      |
++--------------------------+                         +---------------------------+
+          VirtualBox NAT Network (both VMs can reach each other)
+```
 
-### 2. Universal Forwarder Ingestion Configuration (Windows 10)
-Configured via `inputs.conf` located in `C:\Program Files\SplunkUniversalForwarder\etc\system\local\inputs.conf`:
+**Splunk (Ubuntu):** Settings → Forwarding and receiving → Receive data → listen on port `9997`.
+
+**Forwarder (Windows):** `C:\Program Files\SplunkUniversalForwarder\etc\system\local\inputs.conf`
 
 ```ini
 [default]
@@ -39,39 +31,22 @@ current_only = 0
 checkpointInterval = 5
 index = main
 ```
-### 3. Attack Simulation & MITRE ATT&CK Mapping 
 
-1. Brute-Force & Password Spraying (MITRE ATT&CK T1110)
+---
 
-Technique: T1110.001 - Password Guessing / Password Spraying.
+## Attack 1: Failed logons with fake accounts (password spraying)
 
-Execution: Executed high-frequency authentication attempts across non-existent user accounts (FakeAdmin1..12) using bad password seeds via PowerShell:
-```
+One password tried against 12 accounts that don't exist (`FakeAdmin1` … `FakeAdmin12`), from PowerShell on the Windows VM:
+
+```powershell
 1..12 | ForEach-Object { net use \\127.0.0.1 /user:FakeAdmin"$_" "WrongPass2026!" 2>$null }
 ```
-Telemetric Artifact: Rapid bursts of Windows Event ID 4625 (An account failed to log on) with status code 0xC000006A (bad username/password).
 
-2. Unauthorized Account Creation & Local Group Escalation (MITRE ATT&CK T1136 & T1098)
+Each attempt should create an Event **4625** (an account failed to log on). MITRE: **T1110.003 – Password Spraying** (same password, many usernames).
 
-Technique: T1136.001 (Create Local Account) & T1098 (Account Manipulation).
+**Detection:**
 
-Execution: Adversary staging a backdoor administrative account and persisting by elevating privileges into the local Administrators security group:
-```
-net user RogueAnalyst "P@ssw0rdSecure2026!" /add
-net localgroup Administrators RogueAnalyst /add
-```
-Telemetric Artifacts:
-
-Event ID 4720: A user account was created.
-
-Event ID 4732: A member was added to a security-enabled local group.
-
-### 4. Detection Engineering & Analytics 
-
-Query 1: High-Frequency Failed Authentication (Brute-Force Detection)
-Logic: Aggregates failed logon attempts (4625) by targeted account, originating IP, and workstation name. Enforces an alert threshold (> 5 attempts) to isolate brute-force spikes from routine human typographical error.
-
-```
+```spl
 index=main sourcetype="WinEventLog:Security" EventCode=4625
 | eval TargetUser = coalesce(TargetUserName, Target_Account, user, "Unknown")
 | eval SourceIP = coalesce(IpAddress, src_ip, Source_Network_Address, "Local/127.0.0.1")
@@ -80,42 +55,53 @@ index=main sourcetype="WinEventLog:Security" EventCode=4625
 | sort - Failed_Attempts
 ```
 
-Query 2: Account Lifecycle & Privilege Escalation Audit
-Logic: Tracks the creation of new security principals (4720) and immediate administrative privilege delegation (4732), correlating the executing user with the target backdoor account.
+**Result:** 8 failed logons, 7 of them from `127.0.0.1`.
 
+**Things I noticed in the result:**
+- `TargetUser` shows **Unknown**, which means none of the field names in my `coalesce()` matched the username field in this Splunk version. Next fix: check the raw event, find the real field name (for example `Account_Name`), and add it.
+- I ran 12 attempts but got 8 events, so some attempts didn't generate a 4625. I'd check this by looking at the raw events and the `Failure Reason` / status code. A user that doesn't exist (`0xC0000064`) and a wrong password (`0xC000006A`) have different codes, and that difference is useful when telling spraying apart from a real user who forgot their password.
+
+![Failed logon detection](evidence/Active%20Detection%20Brute%20Force.png)
+
+---
+
+## Attack 2: Backdoor admin account
+
+```powershell
+net user RogueAnalyst "P@ssw0rdSecure2026!" /add
+net localgroup Administrators RogueAnalyst /add
 ```
+
+| Event ID | Meaning | MITRE |
+| :--- | :--- | :--- |
+| **4720** | A user account was created | T1136.001 – Create Account: Local Account |
+| **4732** | A member was added to a security-enabled local group (Administrators) | T1098 – Account Manipulation |
+
+**Detection:**
+
+```spl
 index=main sourcetype="WinEventLog:Security" (EventCode=4720 OR EventCode=4732)
-| eval Activity=case(EventCode=4720, "User Account Provisioned", EventCode=4732, "Privilege Elevation (Administrators)")
+| eval Activity=case(EventCode=4720, "User account created", EventCode=4732, "Added to Administrators")
 | eval Target = coalesce(TargetUserName, MemberName, "RogueAnalyst")
 | eval Operator = coalesce(SubjectUserName, user, "Administrator")
 | table _time, EventCode, Activity, Operator, Target
 | sort - _time
 ```
 
----
+A new account that gets admin rights within seconds of being created is a classic persistence pattern, and both events appear one after the other in the timeline.
 
-## Key SOC Findings & Investigative Triage
+![Account creation and privilege escalation](evidence/Privilege%20Escalation%201.png)
 
-| Incident / Telemetry Indicator | Target Account | MITRE ATT&CK Tactic & Technique | Triage Severity | Recommended L1/L2 SOC Action |
-| :--- | :--- | :--- | :--- | :--- |
-| **Event ID 4625 (>5 Failures)** | `Unknown` / Target Seed | Credential Access (T1110) | **Medium** | Verify `SourceIP`, check for account lockout status, correlate with perimeter firewall traffic. |
-| **Event ID 4720** | `RogueAnalyst` | Persistence (T1136.001) | **High** | Validate account creation against change control tickets; disable unauthorized account immediately. |
-| **Event ID 4732** | `RogueAnalyst` | Privilege Escalation (T1098) | **Critical** | Remove account from local Administrators group, isolate host from network, and collect memory dump for forensic analysis. |
+![Event details](evidence/Privilege%20Escalation%202.png)
 
 ---
 
-## Evidence & Verification
+## How I'd triage these alerts
 
-### 1. Brute-Force & Credential Access Detection
-Detection of high-frequency logon failures using Event ID 4625 aggregated by source IP and target principal.
+| Alert | Severity | First steps |
+| :--- | :--- | :--- |
+| Many 4625 from one source | Medium | Check the source IP and usernames, check for account lockouts, look for a successful logon (4624) right after |
+| 4720 (new account) | High | Confirm whether there's an approved change request; if not, disable the account |
+| 4732 (added to Administrators) | Critical | Remove it from the group, isolate the host, and find out which account made the change |
 
-![Brute Force Detection](evidence/Active%20Detection%20Brute%20Force.png)
-
-### 2. Unauthorized Account Provisioning & Privilege Escalation
-Telemetry correlation showing the creation of `RogueAnalyst` (Event ID 4720) and subsequent addition to the local Administrators group (Event ID 4732).
-
-![Privilege Escalation Detection 1](evidence/Privilege%20Escalation%201.png)
-
-Detailed event breakdown and timestamp sequencing:
-
-![Privilege Escalation Detection 2](evidence/Privilege%20Escalation%202.png)
+**Author:** Alejandro José Vargas
